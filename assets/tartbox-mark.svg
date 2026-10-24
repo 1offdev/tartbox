@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Tartbox mark</title>
+  <desc id="desc">A geometric berry tart rising from an open teal box with a command prompt symbol.</desc>
+
+  <rect width="256" height="256" rx="52" fill="#172033"/>
+
+  <!-- The tart: a simple crimped crust and berry filling. -->
+  <g stroke="#172033" stroke-width="7" stroke-linejoin="round">
+    <circle cx="128" cy="102" r="58" fill="#F4B942"/>
+    <circle cx="128" cy="102" r="43" fill="#E85D5D"/>
+  </g>
+  <g fill="none" stroke="#FFF1CF" stroke-width="7" stroke-linecap="round" opacity=".95">
+    <path d="M99 77l58 50M88 99l45 39M123 66l49 42"/>
+    <path d="M157 77l-58 50M168 99l-45 39M133 66l-49 42"/>
+  </g>
+
+  <!-- Open container flaps and front wall. -->
+  <g stroke="#172033" stroke-width="7" stroke-linejoin="round">
+    <path d="M42 137l52-27 34 27-48 29z" fill="#70D0C1"/>
+    <path d="M214 137l-52-27-34 27 48 29z" fill="#70D0C1"/>
+    <path d="M42 137l38 29v49l48-27v-51l-48 29z" fill="#319A91"/>
+    <path d="M214 137l-38 29v49l-48-27v-51l48 29z" fill="#49B7AA"/>
+  </g>
+
+  <!-- A small terminal prompt, drawn as geometry rather than type. -->
+  <g fill="none" stroke="#FFF1CF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M92 177l11 9-11 9M111 198h16"/>
+  </g>
+</svg>

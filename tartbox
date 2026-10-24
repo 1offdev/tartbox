@@ -1,0 +1,988 @@
+#!/bin/bash
+#
+# Tartbox v0.2.0
+#
+# Small, auditable wrapper around Tart for isolated macOS/Xcode development.
+#
+# Security model:
+#   - Tart macOS VM is the isolation boundary.
+#   - Only the current project directory is shared with the VM.
+#   - Softnet provides network isolation.
+#   - Coding agents may run with full permissions INSIDE the VM.
+#   - Host home, SSH keys, Desktop, Documents, etc. are not shared.
+#
+# Optional environment:
+#   TART_HOME
+#   TARTBOX_DEV_ROOT
+#   TARTBOX_GOLD_VM
+#   TARTBOX_BASE_IMAGE
+#
+
+set -uo pipefail
+
+VERSION="0.2.0"
+
+GOLD_VM="${TARTBOX_GOLD_VM:-goldcopy}"
+BASE_IMAGE="${TARTBOX_BASE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:latest}"
+DEV_ROOT="${TARTBOX_DEV_ROOT:-$HOME/Development}"
+GUEST_WORKSPACE="/Volumes/My Shared Files/workspace"
+LAUNCH_AGENT_LABEL="dev.tartbox.update-gold"
+LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
+SCHEDULE_LOG_DIR="$HOME/Library/Logs/Tartbox"
+
+KNOWN_AGENTS=(
+  codex
+  claude
+  gemini
+  aider
+  opencode
+  goose
+  amp
+  cursor-agent
+  copilot
+)
+
+PROJECT=""
+
+# ─────────────────────────────────────────────────────────────
+# Terminal UI
+# ─────────────────────────────────────────────────────────────
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'
+  RED=$'\033[31m'
+  CYAN=$'\033[36m'
+  RESET=$'\033[0m'
+else
+  BOLD=""
+  DIM=""
+  GREEN=""
+  YELLOW=""
+  RED=""
+  CYAN=""
+  RESET=""
+fi
+
+ok()   { printf "%s✓%s %s\n" "$GREEN" "$RESET" "$*"; }
+info() { printf "%s◆%s %s\n" "$CYAN" "$RESET" "$*"; }
+warn() { printf "%s!%s %s\n" "$YELLOW" "$RESET" "$*"; }
+fail() { printf "%s✗%s %s\n" "$RED" "$RESET" "$*" >&2; }
+
+die() {
+  fail "$*"
+  exit 1
+}
+
+header() {
+  printf "\n"
+  printf "%s╭──────────────────────────────────────────────╮%s\n" "$BOLD" "$RESET"
+  printf "%s│   Tartbox                                  │%s\n" "$BOLD" "$RESET"
+  printf "%s╰──────────────────────────────────────────────╯%s\n" "$BOLD" "$RESET"
+  printf "\n"
+}
+
+section() {
+  printf "\n%s%s%s\n" "$BOLD" "$*" "$RESET"
+}
+
+kv() {
+  printf "  %-12s %s\n" "$1" "$2"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Basic helpers
+# ─────────────────────────────────────────────────────────────
+
+require_tart() {
+  command -v tart >/dev/null 2>&1 ||
+    die "Tart is not installed. Install it with: brew install openai/tools/tart"
+}
+
+vm_exists() {
+  tart get "$1" >/dev/null 2>&1
+}
+
+vm_running() {
+  tart list 2>/dev/null |
+    awk -v vm="$1" '$1 == "local" && $2 == vm && $NF == "running" { found=1 } END { exit !found }'
+}
+
+project_vm_name() {
+  local project_name hash
+
+  project_name="$(basename "$1")"
+  project_name="$(
+    printf '%s' "$project_name" |
+      tr '[:upper:]' '[:lower:]' |
+      tr -cs 'a-z0-9._-' '-'
+  )"
+  project_name="${project_name%-}"
+
+  hash="$(
+    printf '%s' "$1" |
+      shasum -a 256 |
+      awk '{print substr($1,1,8)}'
+  )"
+
+  printf "tartbox-%s-%s" "$project_name" "$hash"
+}
+
+validate_vm_name() {
+  local name="$1"
+
+  [[ ${#name} -le 63 ]] ||
+    die "VM name is too long (maximum 63 characters): $name"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "Invalid VM name '$name'. Use letters, numbers, '.', '_' or '-', starting with a letter or number."
+}
+
+validate_workspace() {
+  local devroot project parent
+
+  [[ -d "$DEV_ROOT" ]] ||
+    die "Development root does not exist: $DEV_ROOT"
+
+  devroot="$(cd "$DEV_ROOT" && pwd -P)" ||
+    die "Unable to resolve development root."
+
+  project="$(pwd -P)" ||
+    die "Unable to resolve current directory."
+
+  parent="$(dirname "$project")"
+
+  if [[ "$parent" != "$devroot" ]]; then
+    fail "Refusing to start."
+    printf "\n"
+    printf "Workspace must be an immediate child of:\n"
+    printf "  %s\n\n" "$devroot"
+    printf "Current directory:\n"
+    printf "  %s\n" "$project"
+    exit 1
+  fi
+
+  PROJECT="$project"
+}
+
+# ─────────────────────────────────────────────────────────────
+# TART_HOME
+# ─────────────────────────────────────────────────────────────
+
+configure_tart_home() {
+  if [[ -n "${TART_HOME:-}" ]]; then
+    ok "TART_HOME already configured: $TART_HOME"
+    return
+  fi
+
+  section "Tart storage"
+
+  printf "Tart VM images can consume significant disk space.\n"
+  printf "Tart normally stores its data under ~/.tart.\n\n"
+  printf "Enter a custom Tart storage directory, or press Enter for the default.\n"
+  printf "> "
+
+  local answer
+  IFS= read -r answer
+
+  if [[ -z "$answer" ]]; then
+    info "Using Tart's default storage location."
+    return
+  fi
+
+  answer="${answer/#\~/$HOME}"
+
+  mkdir -p "$answer" || die "Unable to create: $answer"
+  [[ -w "$answer" ]] || die "Directory is not writable: $answer"
+
+  export TART_HOME="$answer"
+
+  local shell_rc="$HOME/.zshrc"
+
+  if [[ ! -f "$shell_rc" ]]; then
+    touch "$shell_rc" || die "Unable to create $shell_rc"
+  fi
+
+  if grep -q '^[[:space:]]*export TART_HOME=' "$shell_rc"; then
+    warn "TART_HOME already appears in $shell_rc."
+    warn "Not modifying the existing entry."
+  else
+    {
+      printf "\n# Tart VM storage\n"
+      printf 'export TART_HOME=%q\n' "$TART_HOME"
+    } >> "$shell_rc"
+    ok "Added TART_HOME to $shell_rc"
+  fi
+
+  ok "Tart storage: $TART_HOME"
+}
+
+# ─────────────────────────────────────────────────────────────
+# VM lifecycle
+# ─────────────────────────────────────────────────────────────
+
+wait_for_guest() {
+  local vm="$1"
+  local pid="$2"
+  local log="$3"
+  local attempts=0 elapsed=0
+
+  while ! tart exec "$vm" true >/dev/null 2>&1; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      [[ -t 1 ]] && printf "\r\033[K"
+      fail "VM failed to start: $vm"
+
+      if [[ -s "$log" ]]; then
+        printf "\n%sTart output:%s\n" "$BOLD" "$RESET"
+        cat "$log"
+      fi
+      return 1
+    fi
+
+    attempts=$((attempts + 1))
+    elapsed=$((attempts * 2))
+
+    if (( attempts >= 60 )); then
+      [[ -t 1 ]] && printf "\r\033[K"
+      fail "Timed out waiting for VM '$vm'."
+
+      if [[ -s "$log" ]]; then
+        printf "\n%sTart output:%s\n" "$BOLD" "$RESET"
+        cat "$log"
+      fi
+      return 1
+    fi
+
+    if [[ -t 1 ]]; then
+      printf "\r%s⟳%s Booting macOS... %ss" "$CYAN" "$RESET" "$elapsed"
+    elif (( attempts == 1 || attempts % 5 == 0 )); then
+      printf "⟳ Booting macOS... %ss\n" "$elapsed"
+    fi
+    sleep 2
+  done
+
+  [[ -t 1 ]] && printf "\r\033[K"
+  ok "Guest agent ready (${elapsed}s)"
+  return 0
+}
+
+start_vm() {
+  local vm="$1"
+  local workspace="${2:-}"
+  local headless="${3:-false}"
+  local log="${TMPDIR:-/tmp}/tartbox-${vm}.log"
+
+  if vm_running "$vm"; then
+    ok "VM already running: $vm"
+    return 0
+  fi
+
+  local args=(run --net-softnet)
+
+  if [[ "$headless" == "true" ]]; then
+    args+=(--no-graphics)
+  fi
+
+  if [[ -n "$workspace" ]]; then
+    args+=(--dir="workspace:$workspace")
+  fi
+
+  args+=("$vm")
+
+  info "Starting VM: $vm"
+  : > "$log"
+
+  nohup tart "${args[@]}" >"$log" 2>&1 &
+  local pid=$!
+
+  if ! wait_for_guest "$vm" "$pid" "$log"; then
+    return 1
+  fi
+
+  return 0
+}
+
+stop_vm() {
+  local vm="$1"
+
+  if vm_running "$vm"; then
+    info "Stopping VM: $vm"
+    tart stop "$vm" >/dev/null || return 1
+    ok "VM stopped"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Guest maintenance
+# ─────────────────────────────────────────────────────────────
+
+fix_dns() {
+  local vm="$1"
+
+  info "Configuring guest DNS"
+
+  tart exec "$vm" sudo networksetup \
+    -setdnsservers Ethernet 1.1.1.1 1.0.0.1 >/dev/null ||
+    die "Unable to configure guest DNS."
+
+  if tart exec "$vm" zsh -lc \
+    'curl -fsSI --max-time 10 https://google.com >/dev/null'
+  then
+    ok "DNS and Internet connectivity"
+  else
+    die "Guest Internet connectivity check failed."
+  fi
+}
+
+update_brew() {
+  local vm="$1"
+
+  local started elapsed
+  started=$SECONDS
+  info "Updating Homebrew packages (brew update, upgrade, cleanup)"
+
+  if tart exec "$vm" zsh -lc \
+    'HOMEBREW_NO_ASK=1 brew update &&
+     HOMEBREW_NO_ASK=1 brew upgrade &&
+     HOMEBREW_NO_ASK=1 brew cleanup'
+  then
+    elapsed=$((SECONDS - started))
+    ok "Homebrew packages current (${elapsed}s)"
+  else
+    warn "Homebrew update returned an error."
+    return 1
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Agent discovery / authentication
+# ─────────────────────────────────────────────────────────────
+
+agent_installed() {
+  local vm="$1"
+  local agent="$2"
+
+  tart exec "$vm" zsh -lc \
+    "command -v '$agent' >/dev/null 2>&1"
+}
+
+discover_agents() {
+  local vm="$1"
+  local agent
+
+  section "Agents"
+
+  for agent in "${KNOWN_AGENTS[@]}"; do
+    if agent_installed "$vm" "$agent"; then
+      printf "  %s✓%s %-14s installed\n" "$GREEN" "$RESET" "$agent"
+    else
+      printf "  %s—%s %-14s not installed\n" "$DIM" "$RESET" "$agent"
+    fi
+  done
+}
+
+codex_auth_status() {
+  local vm="$1"
+  agent_installed "$vm" codex || return 2
+  tart exec "$vm" codex login status >/dev/null 2>&1
+}
+
+claude_auth_status() {
+  local vm="$1"
+  local output
+
+  agent_installed "$vm" claude || return 2
+  output="$(tart exec "$vm" claude auth status 2>/dev/null)" || return 1
+
+  printf '%s' "$output" |
+    grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'
+}
+
+show_auth_status() {
+  local vm="$1"
+
+  section "Authentication"
+
+  if agent_installed "$vm" codex; then
+    if codex_auth_status "$vm"; then
+      printf "  %s✓%s Codex       authenticated\n" "$GREEN" "$RESET"
+    else
+      printf "  %s!%s Codex       authentication required\n" "$YELLOW" "$RESET"
+    fi
+  fi
+
+  if agent_installed "$vm" claude; then
+    if claude_auth_status "$vm"; then
+      printf "  %s✓%s Claude      authenticated\n" "$GREEN" "$RESET"
+    else
+      printf "  %s!%s Claude      authentication required\n" "$YELLOW" "$RESET"
+    fi
+  fi
+}
+
+authenticate_agents() {
+  local vm="$1"
+  local answer
+
+  section "Agent authentication"
+
+  if agent_installed "$vm" codex; then
+    if codex_auth_status "$vm"; then
+      ok "Codex already authenticated"
+    else
+      printf "Codex is installed but not authenticated.\n"
+      printf "Launch Codex now to authenticate? [Y/n] "
+      IFS= read -r answer
+
+      if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+        tart exec -it "$vm" codex
+        codex_auth_status "$vm" &&
+          ok "Codex authenticated" ||
+          warn "Codex authentication was not detected."
+      fi
+    fi
+  fi
+
+  if agent_installed "$vm" claude; then
+    if claude_auth_status "$vm"; then
+      ok "Claude already authenticated"
+    else
+      printf "\nClaude is installed but not authenticated.\n"
+      printf "Launch Claude now to authenticate? [Y/n] "
+      IFS= read -r answer
+
+      if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+        tart exec -it "$vm" claude
+        claude_auth_status "$vm" &&
+          ok "Claude authenticated" ||
+          warn "Claude authentication was not detected."
+      fi
+    fi
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Codex configuration
+# ─────────────────────────────────────────────────────────────
+
+configure_codex() {
+  local vm="$1"
+
+  agent_installed "$vm" codex || return 0
+
+  info "Configuring Codex Full Access"
+
+  tart exec "$vm" zsh -lc \
+    'mkdir -p ~/.codex &&
+     cat > ~/.codex/config.toml <<'"'"'EOF'"'"'
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[tui]
+screen_reader_detection_done = true
+EOF' || die "Unable to configure Codex."
+
+  ok "Codex configured for Full Access inside VM"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Agent launchers
+# ─────────────────────────────────────────────────────────────
+
+launch_codex() {
+  local vm="$1"
+
+  agent_installed "$vm" codex ||
+    die "Codex is not installed in $vm."
+
+  section "Launching Codex"
+  kv "Workspace" "$GUEST_WORKSPACE"
+  kv "Permissions" "Full Access"
+  printf "\n"
+
+  tart exec -it "$vm" codex -C "$GUEST_WORKSPACE"
+}
+
+launch_claude() {
+  local vm="$1"
+
+  agent_installed "$vm" claude ||
+    die "Claude is not installed in $vm."
+
+  section "Launching Claude"
+  kv "Workspace" "$GUEST_WORKSPACE"
+  kv "Permissions" "bypassPermissions"
+  printf "\n"
+
+  tart exec -it "$vm" zsh -lc \
+    'cd "/Volumes/My Shared Files/workspace" &&
+     exec claude --dangerously-skip-permissions'
+}
+
+# ─────────────────────────────────────────────────────────────
+# Bootstrap
+# ─────────────────────────────────────────────────────────────
+
+bootstrap() {
+  header
+  section "Gold image bootstrap"
+
+  require_tart
+  configure_tart_home
+
+  kv "Base image" "$BASE_IMAGE"
+  kv "Gold VM" "$GOLD_VM"
+  kv "Tart home" "${TART_HOME:-$HOME/.tart}"
+  printf "\n"
+
+  if vm_exists "$GOLD_VM"; then
+    warn "Gold VM already exists: $GOLD_VM"
+    printf "Bootstrap will NOT overwrite it.\n\n"
+    printf "Run 'tartbox --update-gold' to maintain it.\n"
+    exit 1
+  fi
+
+  info "Cloning upstream Xcode image"
+  tart clone "$BASE_IMAGE" "$GOLD_VM" ||
+    die "Unable to clone $BASE_IMAGE"
+
+  ok "Created $GOLD_VM"
+
+  start_vm "$GOLD_VM" "" "false" ||
+    die "Unable to start gold VM."
+
+  fix_dns "$GOLD_VM"
+  update_brew "$GOLD_VM" || true
+  discover_agents "$GOLD_VM"
+  authenticate_agents "$GOLD_VM"
+  configure_codex "$GOLD_VM"
+  show_auth_status "$GOLD_VM"
+
+  section "Verification"
+
+  if agent_installed "$GOLD_VM" codex; then
+    kv "Codex" "$(tart exec "$GOLD_VM" codex --version 2>/dev/null | head -1)"
+  fi
+
+  if agent_installed "$GOLD_VM" claude; then
+    kv "Claude" "$(tart exec "$GOLD_VM" claude --version 2>/dev/null | head -1)"
+  fi
+
+  stop_vm "$GOLD_VM" || warn "Unable to stop gold VM."
+
+  printf "\n"
+  ok "Gold image ready: $GOLD_VM"
+  printf "\n"
+  printf "Create or enter a project directory under:\n"
+  printf "  %s\n\n" "$DEV_ROOT"
+  printf "Then run:\n"
+  printf "  tartbox\n"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Gold maintenance
+# ─────────────────────────────────────────────────────────────
+
+update_gold() {
+  header
+  section "Gold image maintenance"
+
+  require_tart
+
+  vm_exists "$GOLD_VM" ||
+    die "Gold VM '$GOLD_VM' does not exist. Run: tartbox --bootstrap"
+
+  kv "Gold VM" "$GOLD_VM"
+  kv "Tart home" "${TART_HOME:-$HOME/.tart}"
+
+  start_vm "$GOLD_VM" "" "true" ||
+    die "Unable to start gold VM."
+
+  fix_dns "$GOLD_VM"
+  update_brew "$GOLD_VM" || true
+  discover_agents "$GOLD_VM"
+  show_auth_status "$GOLD_VM"
+  configure_codex "$GOLD_VM"
+
+  stop_vm "$GOLD_VM" || warn "Unable to stop gold VM."
+
+  printf "\n"
+  ok "Gold image refreshed"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Scheduled gold maintenance
+# ─────────────────────────────────────────────────────────────
+
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
+
+schedule_update() {
+  local frequency="$1" script_path script_xml log_xml error_log_xml
+
+  [[ "$frequency" == "weekly" ]] ||
+    die "Unsupported schedule '$frequency'. Tartbox currently supports: weekly"
+  require_tart
+
+  script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+  [[ -x "$script_path" ]] || die "Unable to resolve an executable Tartbox script."
+
+  script_xml="$(xml_escape "$script_path")"
+  log_xml="$(xml_escape "$SCHEDULE_LOG_DIR/update-gold.log")"
+  error_log_xml="$(xml_escape "$SCHEDULE_LOG_DIR/update-gold.error.log")"
+
+  info "Installing weekly user LaunchAgent"
+  kv "File" "$LAUNCH_AGENT_PATH"
+  kv "Schedule" "Sunday at 03:00 (local time)"
+  kv "Logs" "$SCHEDULE_LOG_DIR"
+
+  mkdir -p "$HOME/Library/LaunchAgents" "$SCHEDULE_LOG_DIR" ||
+    die "Unable to create LaunchAgent or log directory."
+
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0"><dict>'
+    printf '  <key>Label</key><string>%s</string>\n' "$LAUNCH_AGENT_LABEL"
+    printf '  <key>ProgramArguments</key><array><string>%s</string><string>--update-gold</string></array>\n' "$script_xml"
+    printf '%s\n' '  <key>StartCalendarInterval</key><dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>'
+    printf '  <key>StandardOutPath</key><string>%s</string>\n' "$log_xml"
+    printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$error_log_xml"
+    printf '%s\n' '  <key>ProcessType</key><string>Background</string>'
+    printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
+    printf '    <key>PATH</key><string>%s</string>\n' "$(xml_escape "${PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}")"
+    [[ -n "${TART_HOME:-}" ]] && printf '    <key>TART_HOME</key><string>%s</string>\n' "$(xml_escape "$TART_HOME")"
+    printf '    <key>TARTBOX_DEV_ROOT</key><string>%s</string>\n' "$(xml_escape "$DEV_ROOT")"
+    printf '    <key>TARTBOX_GOLD_VM</key><string>%s</string>\n' "$(xml_escape "$GOLD_VM")"
+    printf '    <key>TARTBOX_BASE_IMAGE</key><string>%s</string>\n' "$(xml_escape "$BASE_IMAGE")"
+    printf '%s\n' '  </dict>'
+    printf '%s\n' '</dict></plist>'
+  } > "$LAUNCH_AGENT_PATH" || die "Unable to write $LAUNCH_AGENT_PATH"
+
+  if ! plutil -lint "$LAUNCH_AGENT_PATH" >/dev/null; then
+    die "The generated LaunchAgent is invalid: $LAUNCH_AGENT_PATH"
+  fi
+
+  launchctl bootout "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH" ||
+    die "LaunchAgent file was created, but launchd could not load it."
+  ok "Scheduled weekly gold-image maintenance"
+  printf "Remove it with: tartbox --unschedule-update\n"
+}
+
+unschedule_update() {
+  if [[ ! -e "$LAUNCH_AGENT_PATH" ]]; then
+    info "Scheduled maintenance is not configured."
+    return 0
+  fi
+
+  info "Removing user LaunchAgent: $LAUNCH_AGENT_PATH"
+  launchctl bootout "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+  rm -f "$LAUNCH_AGENT_PATH" || die "Unable to remove $LAUNCH_AGENT_PATH"
+  ok "Scheduled maintenance removed"
+  printf "Existing logs were retained in: %s\n" "$SCHEDULE_LOG_DIR"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Doctor
+# ─────────────────────────────────────────────────────────────
+
+doctor() {
+  header
+  section "Doctor"
+
+  if command -v tart >/dev/null 2>&1; then
+    ok "Tart installed: $(tart --version 2>/dev/null)"
+  else
+    fail "Tart not installed"
+    return 1
+  fi
+
+  kv "TART_HOME" "${TART_HOME:-"(default: $HOME/.tart)"}"
+  kv "Dev root" "$DEV_ROOT"
+  kv "Gold VM" "$GOLD_VM"
+  kv "Base image" "$BASE_IMAGE"
+  if [[ -f "$LAUNCH_AGENT_PATH" ]]; then
+    kv "Schedule" "weekly ($LAUNCH_AGENT_PATH)"
+  else
+    kv "Schedule" "not configured"
+  fi
+  printf "\n"
+
+  if vm_exists "$GOLD_VM"; then
+    ok "Gold VM exists"
+
+    if vm_running "$GOLD_VM"; then
+      ok "Gold VM is running"
+      discover_agents "$GOLD_VM"
+      show_auth_status "$GOLD_VM"
+    else
+      info "Gold VM is stopped"
+      printf "  Start it to inspect guest agent/auth state.\n"
+    fi
+  else
+    warn "Gold VM does not exist"
+  fi
+
+  printf "\n%sNo changes were made.%s\n" "$DIM" "$RESET"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Project VM
+# ─────────────────────────────────────────────────────────────
+
+run_project() {
+  local agent="$1"
+  local headless="$2"
+  local do_update="$3"
+  local custom_name="$4"
+
+  require_tart
+
+  # IMPORTANT: do not invoke this through command substitution.
+  # A refusal must terminate the main script, not a subshell.
+  validate_workspace
+
+  local project="$PROJECT"
+  local vm
+  if [[ -n "$custom_name" ]]; then
+    validate_vm_name "$custom_name"
+    vm="$custom_name"
+  else
+    vm="$(project_vm_name "$project")"
+  fi
+
+  vm_exists "$GOLD_VM" ||
+    die "Gold VM '$GOLD_VM' does not exist. Run: tartbox --bootstrap"
+
+  header
+
+  kv "Project" "$(basename "$project")"
+  kv "Agent" "$agent"
+  kv "VM" "$vm"
+  kv "Workspace" "$project"
+  kv "Network" "Softnet"
+  kv "Display" "$([[ "$headless" == "true" ]] && printf "Headless" || printf "GUI")"
+  printf "\n"
+
+  if vm_exists "$vm"; then
+    ok "Project VM exists"
+    if [[ -n "$custom_name" ]] && vm_running "$vm"; then
+      die "Custom-named VM '$vm' is already running. Stop it before reuse so Tartbox can mount the selected workspace explicitly."
+    fi
+  else
+    info "Creating project VM from $GOLD_VM"
+    tart clone "$GOLD_VM" "$vm" ||
+      die "Unable to clone project VM."
+    ok "Created $vm"
+  fi
+
+  start_vm "$vm" "$project" "$headless" ||
+    die "Unable to start project VM."
+
+  fix_dns "$vm"
+
+  if [[ "$do_update" == "true" ]]; then
+    update_brew "$vm" || true
+  else
+    info "Skipping Homebrew update (--no-update)"
+  fi
+
+  show_auth_status "$vm"
+
+  case "$agent" in
+    codex)
+      launch_codex "$vm"
+      ;;
+    claude)
+      launch_claude "$vm"
+      ;;
+    *)
+      die "Agent '$agent' does not yet have a verified launcher."
+      ;;
+  esac
+
+  printf "\n"
+  info "Agent exited; project VM was left intact."
+  kv "VM" "$vm"
+
+  printf "\nTo stop it:\n"
+  printf "  tart stop %s\n\n" "$vm"
+
+  printf "When the project VM is no longer needed:\n"
+  printf "  tart stop %s\n" "$vm"
+  printf "  tart delete %s\n" "$vm"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Help
+# ─────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+Tartbox $VERSION
+
+Tart-based macOS/Xcode development sandboxes for coding agents.
+
+USAGE
+  tartbox [agent] [options]
+
+AGENTS
+  codex                 Launch Codex (default)
+  claude                Launch Claude Code
+
+COMMANDS
+  --bootstrap           Create and configure the gold VM
+  --update-gold         Refresh the existing gold VM
+  --schedule-update [weekly]
+                        Install a weekly user LaunchAgent (opt-in)
+  --unschedule-update   Remove the maintenance LaunchAgent
+  --doctor              Show configuration and health information
+  --help, -h            Show this help
+  --version             Show version
+
+PROJECT OPTIONS
+  --headless            Run without Tart's graphical VM window
+  --gui                 Run with graphical VM window (default)
+  --no-update           Skip Homebrew refresh for this launch
+  --name NAME           Override the project VM name
+
+DEFAULTS
+  Development root:     \$HOME/Development
+  Gold VM:              goldcopy
+  Base image:           ghcr.io/cirruslabs/macos-tahoe-xcode:latest
+
+OVERRIDES
+  export TARTBOX_DEV_ROOT="/path/to/projects"
+  export TARTBOX_GOLD_VM="my-gold-vm"
+  export TARTBOX_BASE_IMAGE="..."
+  export TART_HOME="/Volumes/MyDisk/tart"
+
+WORKSPACE SAFETY
+  The current directory must be an immediate child of TARTBOX_DEV_ROOT.
+  No Git repository is required; empty project directories are valid.
+
+GUEST WORKSPACE
+  /Volumes/My Shared Files/workspace
+
+EXAMPLES
+  cd ~/Development/my-project
+
+  tartbox
+  tartbox codex
+  tartbox claude
+  tartbox --headless
+  tartbox claude --headless --name my-project-vm
+  tartbox --no-update
+  tartbox --schedule-update weekly
+
+VM LIFECYCLE
+  Exiting an agent does NOT stop or delete the project VM.
+
+  Stop:
+    tart stop <vm>
+
+  Delete when finished:
+    tart delete <vm>
+
+SECURITY MODEL
+  Agents receive broad permissions inside the Tart VM.
+
+  Codex:
+    approval_policy = "never"
+    sandbox_mode = "danger-full-access"
+
+  Claude:
+    --dangerously-skip-permissions
+
+  Tart + the project-only VirtioFS share + Softnet are the primary
+  isolation boundary. Host SSH keys, Desktop, Documents and other host
+  home-directory contents are not intentionally shared.
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────
+
+AGENT="codex"
+HEADLESS="false"
+DO_UPDATE="true"
+CUSTOM_VM_NAME=""
+
+if (( $# == 0 )); then
+  run_project "$AGENT" "$HEADLESS" "$DO_UPDATE" "$CUSTOM_VM_NAME"
+  exit $?
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    codex|claude)
+      AGENT="$1"
+      ;;
+    --headless)
+      HEADLESS="true"
+      ;;
+    --gui)
+      HEADLESS="false"
+      ;;
+    --no-update)
+      DO_UPDATE="false"
+      ;;
+    --name)
+      (( $# >= 2 )) || die "--name requires a VM name."
+      CUSTOM_VM_NAME="$2"
+      validate_vm_name "$CUSTOM_VM_NAME"
+      shift
+      ;;
+    --bootstrap)
+      bootstrap
+      exit $?
+      ;;
+    --update-gold)
+      update_gold
+      exit $?
+      ;;
+    --schedule-update)
+      frequency="weekly"
+      if (( $# >= 2 )) && [[ "$2" != --* ]]; then
+        frequency="$2"
+        shift
+      fi
+      schedule_update "$frequency"
+      exit $?
+      ;;
+    --unschedule-update)
+      unschedule_update
+      exit $?
+      ;;
+    --doctor)
+      doctor
+      exit $?
+      ;;
+    --version)
+      printf "tartbox %s\n" "$VERSION"
+      exit 0
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown option: $1"
+      printf "Run 'tartbox --help' for usage.\n"
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+run_project "$AGENT" "$HEADLESS" "$DO_UPDATE" "$CUSTOM_VM_NAME"
