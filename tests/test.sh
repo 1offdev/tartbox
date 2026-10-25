@@ -54,6 +54,12 @@ assert() {
   fi
 }
 
+count_matches() {
+  local expected="$1" file="$2" pattern="$3" actual
+  actual="$(grep -Fc -- "$pattern" "$file" || true)"
+  [[ "$actual" == "$expected" ]]
+}
+
 mkdir -p "$MOCK_BIN" "$MOCK_STATE" "$TEST_ROOT/home" \
   "$TEST_ROOT/dev/project space" "$TEST_ROOT/dev/nested/child"
 : > "$MOCK_LOG"
@@ -75,7 +81,10 @@ case "${1:-}" in
     printf '2.29.0-test\n'
     ;;
   get)
-    [[ "$2" == "goldcopy" || -e "$MOCK_STATE/vm-$2" ]]
+    if [[ "$2" == "goldcopy" && "${MOCK_NO_GOLD:-0}" != "1" ]]; then
+      exit 0
+    fi
+    [[ -e "$MOCK_STATE/vm-$2" ]]
     ;;
   list)
     while IFS= read -r vm; do
@@ -101,13 +110,42 @@ case "${1:-}" in
       grep -Fxq -- "$vm" "$MOCK_STATE/running"
       exit
     fi
+    if [[ "${1:-}" == "sudo" && "${2:-}" == "networksetup" ]]; then
+      if [[ "${MOCK_INTERRUPT_DNS:-0}" == "1" ]]; then
+        kill -TERM "$PPID"
+        exit 1
+      fi
+      [[ "${MOCK_FAIL_DNS:-0}" == "1" ]] && exit 1
+      exit 0
+    fi
     if [[ "${1:-}" == "zsh" && "${3:-}" == *"command -v"* ]]; then
       [[ "${3:-}" == *"codex"* ]]
       exit
     fi
+    if [[ "${1:-}" == "zsh" && "${3:-}" == "test -f ~/.codex/config.toml" ]]; then
+      [[ -e "$MOCK_STATE/codex-config-$vm" ]]
+      exit
+    fi
+    if [[ "${1:-}" == "zsh" && "${3:-}" == "test -e ~/.codex/config.toml.tartbox-backup" ]]; then
+      [[ -e "$MOCK_STATE/codex-backup-$vm" ]]
+      exit
+    fi
+    if [[ "${1:-}" == "zsh" && "${3:-}" == *"cp -p ~/.codex/config.toml"* ]]; then
+      : > "$MOCK_STATE/codex-backup-$vm"
+      exit 0
+    fi
+    if [[ "${1:-}" == "zsh" && "${3:-}" == *"cat > ~/.codex/config.toml"* ]]; then
+      : > "$MOCK_STATE/codex-config-$vm"
+      exit 0
+    fi
     exit 0
     ;;
   stop)
+    if [[ "${MOCK_FAIL_STOP_ONCE:-0}" == "1" && ! -e "$MOCK_STATE/stop-failed-once" ]]; then
+      : > "$MOCK_STATE/stop-failed-once"
+      exit 1
+    fi
+    [[ "${MOCK_FAIL_STOP:-0}" == "1" ]] && exit 1
     remove_running "$2"
     ;;
 esac
@@ -170,12 +208,24 @@ else
 fi
 assert "custom refusal does not stop the existing VM" not_contains "$MOCK_LOG" "stop custom.vm"
 
+# A project VM may never alias the credential-bearing gold VM.
+: > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+if (cd "$PROJECT" && "$TARTBOX" --name goldcopy --no-update >"$TEST_ROOT/gold-alias.out" 2>&1); then
+  fail "gold VM cannot be selected as a project VM"
+else
+  pass "gold VM cannot be selected as a project VM"
+fi
+assert "gold alias refusal is clear" contains "$TEST_ROOT/gold-alias.out" "cannot be used as a project VM"
+assert "gold alias is refused before Tart access" test ! -s "$MOCK_LOG"
+
 # A stopped existing VM is started by Tartbox with exactly one validated share.
 : > "$MOCK_STATE/running"
 : > "$MOCK_LOG"
 (cd "$PROJECT" && "$TARTBOX" --name custom.vm --no-update >"$TEST_ROOT/stopped.out" 2>&1)
 assert "stopped existing VM is started" contains "$MOCK_LOG" "run --net-softnet --dir=workspace:$PROJECT custom.vm"
 assert "custom name cannot alter workspace share" not_contains "$MOCK_LOG" "--dir=workspace:custom.vm"
+assert "Codex launch enforces danger-full-access" contains "$MOCK_LOG" "codex --sandbox danger-full-access --ask-for-approval never -C /Volumes/My Shared Files/workspace"
 stop_mock_process
 
 # A new VM is cloned and launched with the canonical workspace share.
@@ -230,13 +280,117 @@ else
 fi
 assert "malformed gold name makes no Tart calls" test ! -s "$MOCK_LOG"
 
-# Scheduled jobs use a fixed PATH, not the invoking value.
+# Gold maintenance refuses pre-running VMs and owns stopped VMs through cleanup.
+printf '%s\n' "goldcopy" > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+if "$TARTBOX" --update-gold >"$TEST_ROOT/gold-running.out" 2>&1; then
+  fail "already-running gold maintenance is refused"
+else
+  pass "already-running gold maintenance is refused"
+fi
+assert "pre-running gold VM is not stopped" not_contains "$MOCK_LOG" "stop goldcopy"
+
+: > "$MOCK_STATE/running"
+: > "$MOCK_STATE/codex-config-goldcopy"
+rm -f "$MOCK_STATE/codex-backup-goldcopy"
+: > "$MOCK_LOG"
+"$TARTBOX" --update-gold >"$TEST_ROOT/gold-success.out" 2>&1
+assert "successful gold maintenance stops its VM" contains "$MOCK_LOG" "stop goldcopy"
+assert "successful gold cleanup stops exactly once" count_matches 1 "$MOCK_LOG" "stop goldcopy"
+assert "first Codex configuration preserves original backup" contains "$MOCK_LOG" "cp -p ~/.codex/config.toml ~/.codex/config.toml.tartbox-backup"
+stop_mock_process
+
+: > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+rm -f "$MOCK_STATE/stop-failed-once"
+if MOCK_FAIL_STOP_ONCE=1 "$TARTBOX" --update-gold >"$TEST_ROOT/gold-stop-failure.out" 2>&1; then
+  fail "gold stop failure is reported"
+else
+  pass "gold stop failure is reported"
+fi
+assert "gold stop failure does not report refresh success" not_contains "$TEST_ROOT/gold-stop-failure.out" "Gold image refreshed"
+assert "failed explicit cleanup retains ownership for EXIT" count_matches 2 "$MOCK_LOG" "stop goldcopy"
+assert "final EXIT cleanup stops the gold VM" not_contains "$MOCK_STATE/running" "goldcopy"
+stop_mock_process
+
+: > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+if MOCK_FAIL_STOP=1 "$TARTBOX" --update-gold >"$TEST_ROOT/gold-stop-always-fails.out" 2>&1; then
+  fail "persistent gold stop failure is reported"
+else
+  pass "persistent gold stop failure is reported"
+fi
+assert "cleanup failure gets one bounded EXIT attempt without recursion" count_matches 2 "$MOCK_LOG" "stop goldcopy"
+stop_mock_process
+
+: > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+"$TARTBOX" --update-gold >"$TEST_ROOT/gold-second.out" 2>&1
+assert "subsequent Codex configuration does not overwrite backup" not_contains "$MOCK_LOG" "cp -p ~/.codex/config.toml ~/.codex/config.toml.tartbox-backup"
+assert "existing original backup is reported as preserved" contains "$TEST_ROOT/gold-second.out" "Preserving existing backup"
+stop_mock_process
+
+: > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+if MOCK_FAIL_DNS=1 "$TARTBOX" --update-gold >"$TEST_ROOT/gold-failure.out" 2>&1; then
+  fail "post-readiness gold failure is reported"
+else
+  pass "post-readiness gold failure is reported"
+fi
+assert "post-readiness failure stops owned gold VM" contains "$MOCK_LOG" "stop goldcopy"
+stop_mock_process
+
+: > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+MOCK_INTERRUPT_DNS=1 "$TARTBOX" --update-gold >"$TEST_ROOT/gold-interrupt.out" 2>&1
+interrupt_status=$?
+if [[ "$interrupt_status" -eq 0 ]]; then
+  fail "gold maintenance interruption exits unsuccessfully"
+else
+  pass "gold maintenance interruption exits unsuccessfully"
+fi
+assert "gold maintenance interruption preserves status 130" test "$interrupt_status" -eq 130
+assert "interruption stops owned gold VM" contains "$MOCK_LOG" "stop goldcopy"
+assert "successful signal cleanup stops exactly once" count_matches 1 "$MOCK_LOG" "stop goldcopy"
+stop_mock_process
+
+: > "$MOCK_STATE/running"
+: > "$MOCK_LOG"
+MOCK_INTERRUPT_DNS=1 MOCK_FAIL_STOP=1 \
+  "$TARTBOX" --update-gold >"$TEST_ROOT/gold-interrupt-stop-failure.out" 2>&1
+interrupt_cleanup_status=$?
+assert "signal cleanup failure preserves status 130" test "$interrupt_cleanup_status" -eq 130
+assert "signal cleanup failure is reported" contains "$TEST_ROOT/gold-interrupt-stop-failure.out" "Gold VM cleanup failed"
+assert "signal cleanup gets one bounded EXIT attempt" count_matches 2 "$MOCK_LOG" "stop goldcopy"
+stop_mock_process
+
+# Scheduling refuses guest-writable executables, then works from a host-only path.
+: > "$MOCK_LOG"
+if TARTBOX_DEV_ROOT="$ROOT" "$TARTBOX" --schedule-update >"$TEST_ROOT/schedule-unsafe.out" 2>&1; then
+  fail "scheduling refuses executable inside development root"
+else
+  pass "scheduling refuses executable inside development root"
+fi
+assert "unsafe scheduling explains host-only install" contains "$TEST_ROOT/schedule-unsafe.out" "host-only location"
+
+mkdir -p "$TEST_ROOT/dev/tool" "$TEST_ROOT/host-bin"
+cp "$TARTBOX" "$TEST_ROOT/dev/tool/tartbox"
+chmod +x "$TEST_ROOT/dev/tool/tartbox"
+ln -s "$TEST_ROOT/dev/tool/tartbox" "$TEST_ROOT/host-bin/tartbox"
+if "$TEST_ROOT/host-bin/tartbox" --schedule-update >"$TEST_ROOT/schedule-symlink.out" 2>&1; then
+  fail "scheduling resolves symlink into development root"
+else
+  pass "scheduling resolves symlink into development root"
+fi
+
+# Scheduled jobs use Sunday and a fixed PATH, not the invoking value.
 : > "$MOCK_LOG"
 PATH="$MOCK_BIN:/evil/bin:/usr/bin:/bin" "$TARTBOX" --schedule-update >"$TEST_ROOT/schedule.out" 2>&1
 PLIST="$HOME/Library/LaunchAgents/dev.tartbox.update-gold.plist"
 assert "LaunchAgent excludes arbitrary PATH entries" not_contains "$PLIST" "/evil/bin"
 assert "LaunchAgent includes explicit Homebrew and system paths" contains "$PLIST" "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 assert "LaunchAgent records the intended Tartbox executable" contains "$PLIST" "$TARTBOX"
+assert "LaunchAgent schedules Sunday" contains "$PLIST" "<key>Weekday</key><integer>0</integer>"
 
 # Doctor may inspect but must not mutate.
 : > "$MOCK_LOG"

@@ -84,7 +84,7 @@ tartbox --bootstrap
 
 Bootstrap clones `ghcr.io/cirruslabs/macos-tahoe-xcode:latest` to the local gold VM `goldcopy` (both configurable), starts it, configures guest DNS, updates Homebrew, discovers known agents, and configures Codex Full Access. It reports authentication state for Codex and Claude and offers to launch an unauthenticated supported agent interactively. Tartbox never asks for, copies, or parses tokens; normal agent authentication stores credentials inside the gold VM.
 
-To guarantee that Codex's `approval_policy` and `sandbox_mode` are top-level TOML values, Tartbox replaces the gold VM's `~/.codex/config.toml`. If that file already exists, Tartbox says what it is doing and first copies it to `~/.codex/config.toml.tartbox-backup`. This deliberately favors a small, auditable operation over a fragile shell-based TOML editor; unrelated settings in the active file are not preserved automatically.
+To guarantee that Codex's `approval_policy` and `sandbox_mode` are top-level TOML values, Tartbox replaces the gold VM's `~/.codex/config.toml`. If that file already exists and `~/.codex/config.toml.tartbox-backup` does not, Tartbox says what it is doing and preserves that original file as the backup. Later maintenance never overwrites the Tartbox backup. This deliberately favors a small, auditable operation over a fragile shell-based TOML editor; unrelated settings in the active file are not preserved automatically.
 
 Project VMs inherit that authentication state. The gold VM therefore contains reusable sensitive credentials. Do not export, distribute, or share your personal gold VM. Bootstrap refuses to overwrite an existing gold VM.
 
@@ -121,9 +121,13 @@ tartbox --no-update     # skip this project's Homebrew refresh
 
 Without `--name`, the VM name is deterministic: a `tartbox-` prefix, a sanitized project-directory name, and a hash of its resolved path. `--name` changes only the Tart VM name. It does not change or relax workspace validation, and accepts only a conservative set of letters, digits, dots, underscores, and hyphens.
 
+The effective project VM name may never equal `TARTBOX_GOLD_VM`. Tartbox rejects that collision before accessing the gold VM.
+
+Tart does not expose reliable provenance that lets this small wrapper distinguish a stopped, custom-named Tartbox project VM from some unrelated stopped Tart VM with the same name. Therefore `--name` will reuse a matching stopped VM. Choose a unique name and inspect existing VMs with `tart list`; Tartbox will still refuse the VM if it is already running and will always mount only the currently validated workspace when it starts the stopped VM.
+
 Tartbox refuses to launch an agent into **any** already-running project VM, including one with an automatic name. It cannot verify how another process started that VM or which host directories are currently shared. Stop the VM first; Tartbox will then start it itself with the validated project as its only explicit directory share. Tartbox never stops an already-running project VM automatically.
 
-Codex launches in the shared workspace with `approval_policy = "never"` and `sandbox_mode = "danger-full-access"`. Claude changes into that workspace and launches with `--dangerously-skip-permissions`. These settings remove the agents' normal permission boundary **inside the VM**.
+Codex launches in the shared workspace with the supported per-invocation options `--ask-for-approval never` and `--sandbox danger-full-access`, so a changed project-VM config cannot silently weaken Tartbox's Full Access claim. See the official [Codex CLI reference](https://developers.openai.com/codex/cli/reference). Claude changes into that workspace and launches with `--dangerously-skip-permissions`. These settings remove the agents' normal permission boundary **inside the VM**.
 
 Tartbox detects `codex`, `claude`, `gemini`, `aider`, `opencode`, `goose`, `amp`, `cursor-agent`, and `copilot`. Only Codex and Claude currently have verified authentication and launch integrations. Detection does not imply support.
 
@@ -135,7 +139,7 @@ By default, a project start configures DNS and runs `brew update`, `brew upgrade
 tartbox --update-gold
 ```
 
-Gold maintenance refuses an already-running gold VM. Stop it first so Tartbox does not modify or stop a VM lifecycle started elsewhere.
+Gold maintenance refuses an already-running gold VM. Stop it first so Tartbox does not modify or stop a VM lifecycle started elsewhere. Once Tartbox starts a stopped gold VM, it owns that maintenance lifecycle and stops the VM after success, later failure, or an interrupt signal.
 
 Scheduled maintenance is opt-in:
 
@@ -147,7 +151,9 @@ tartbox --unschedule-update
 
 This installs the user LaunchAgent `~/Library/LaunchAgents/dev.tartbox.update-gold.plist`, scheduled for Sunday at 03:00 local time. It records the effective Tartbox settings at installation time, uses the explicit PATH `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`, and writes output under `~/Library/Logs/Tartbox`. It does not inherit the invoking shell's PATH. The command prints these paths before creating anything. No privileged daemon is installed. Unscheduling removes the plist and unloads it; logs are deliberately retained and may be deleted manually.
 
-The LaunchAgent records the absolute path of the Tartbox executable used to install it. Replacing or upgrading the executable at that path changes what future scheduled runs execute; moving or deleting it will make them fail until the schedule is reinstalled.
+The LaunchAgent records the physical absolute path of the Tartbox executable used to install it. Replacing or upgrading the executable at that path changes what future scheduled runs execute; moving or deleting it will make them fail until the schedule is reinstalled.
+
+Tartbox refuses to schedule an executable located anywhere under `TARTBOX_DEV_ROOT`, including through a symlink. A project in that tree can be writable by an unrestricted guest, so scheduling such an executable could let guest-modified code later run on the host. Install Tartbox in a host-only executable location such as `/usr/local/bin` or `/opt/homebrew/bin` before enabling scheduled maintenance. This is a conservative location check, not a general code-signing or filesystem-integrity guarantee.
 
 The Cirrus Xcode image has included `applesimutils` from the third-party `wix/brew` tap. Homebrew may warn that its formula is not trusted during an upgrade. Tartbox leaves that warning visible and does not automatically trust any tap; review the tap and image provenance before changing Homebrew's trust settings.
 
@@ -178,7 +184,7 @@ Depending on the commands you choose, Tartbox can:
 - Create `~/Library/LaunchAgents/dev.tartbox.update-gold.plist` and `~/Library/Logs/Tartbox` only when you opt into scheduling.
 - Read and write the selected project directory through Tart's directory share while its project VM runs.
 
-Inside VMs it changes DNS settings with `sudo networksetup`, updates Homebrew packages, replaces Codex's `~/.codex/config.toml` after backing up an existing file, and stores authentication created by the agents' own login flows.
+Inside VMs it changes DNS settings with `sudo networksetup`, updates Homebrew packages, replaces Codex's `~/.codex/config.toml` after preserving the original Tartbox backup, and stores authentication created by the agents' own login flows.
 
 Tartbox does not directly execute a host command with `sudo`, but that does **not** mean the complete runtime stack is unprivileged. Tartbox asks Tart to start Softnet with `--net-softnet`. [Softnet](https://github.com/openai/softnet) documents that its binary needs a SUID bit or passwordless sudo—effectively root privileges during initialization—to create the vmnet interface and perform DHCP-related system changes, after which it drops privileges. Softnet also persistently changes the macOS built-in DHCP server lease time from 86,400 seconds to 600 seconds. This host-side behavior belongs to the networking dependency Tartbox invokes; review the Softnet README and Tart's [DHCP FAQ](https://tart.run/faq/#changing-the-default-dhcp-lease-time) for the installed versions.
 

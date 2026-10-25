@@ -47,6 +47,8 @@ PROJECT=""
 STARTUP_LOG=""
 STARTING_VM=""
 STARTING_PID=""
+OWNED_GOLD_VM=""
+GOLD_CLEANUP_IN_PROGRESS="false"
 
 # ─────────────────────────────────────────────────────────────
 # Terminal UI
@@ -410,6 +412,40 @@ stop_vm() {
   fi
 }
 
+cleanup_owned_gold_vm() {
+  local vm="$OWNED_GOLD_VM"
+
+  [[ -n "$vm" ]] || return 0
+  [[ "$GOLD_CLEANUP_IN_PROGRESS" != "true" ]] || return 0
+
+  GOLD_CLEANUP_IN_PROGRESS="true"
+  trap '' INT TERM HUP
+
+  if ! stop_vm "$vm"; then
+    GOLD_CLEANUP_IN_PROGRESS="false"
+    trap abort_gold_maintenance INT TERM HUP
+    warn "Unable to stop gold VM '$vm'."
+    return 1
+  fi
+
+  OWNED_GOLD_VM=""
+  GOLD_CLEANUP_IN_PROGRESS="false"
+  trap - EXIT INT TERM HUP
+}
+
+abort_gold_maintenance() {
+  warn "Gold maintenance interrupted; stopping the gold VM started by Tartbox."
+  cleanup_owned_gold_vm ||
+    warn "Gold VM cleanup failed; the EXIT cleanup will make one final attempt."
+  exit 130
+}
+
+own_gold_vm_lifecycle() {
+  OWNED_GOLD_VM="$1"
+  trap cleanup_owned_gold_vm EXIT
+  trap abort_gold_maintenance INT TERM HUP
+}
+
 # ─────────────────────────────────────────────────────────────
 # Guest maintenance
 # ─────────────────────────────────────────────────────────────
@@ -572,10 +608,16 @@ configure_codex() {
 
   if tart exec "$vm" zsh -lc 'test -f ~/.codex/config.toml' >/dev/null 2>&1; then
     warn "Replacing ~/.codex/config.toml to guarantee top-level Full Access settings."
-    info "Backing up existing config to ~/.codex/config.toml.tartbox-backup"
-    tart exec "$vm" zsh -lc \
-      'cp -p ~/.codex/config.toml ~/.codex/config.toml.tartbox-backup' ||
-      die "Unable to back up the existing Codex configuration."
+    if tart exec "$vm" zsh -lc \
+      'test -e ~/.codex/config.toml.tartbox-backup' >/dev/null 2>&1
+    then
+      info "Preserving existing backup: ~/.codex/config.toml.tartbox-backup"
+    else
+      info "Backing up original config to ~/.codex/config.toml.tartbox-backup"
+      tart exec "$vm" zsh -lc \
+        'cp -p ~/.codex/config.toml ~/.codex/config.toml.tartbox-backup' ||
+        die "Unable to back up the existing Codex configuration."
+    fi
   fi
 
   tart exec "$vm" zsh -lc \
@@ -606,7 +648,10 @@ launch_codex() {
   kv "Permissions" "Full Access"
   printf "\n"
 
-  tart exec -it "$vm" codex -C "$GUEST_WORKSPACE"
+  tart exec -it "$vm" codex \
+    --sandbox danger-full-access \
+    --ask-for-approval never \
+    -C "$GUEST_WORKSPACE"
 }
 
 launch_claude() {
@@ -656,6 +701,7 @@ bootstrap() {
 
   start_vm "$GOLD_VM" "" "false" ||
     die "Unable to start gold VM."
+  own_gold_vm_lifecycle "$GOLD_VM"
 
   fix_dns "$GOLD_VM"
   update_brew "$GOLD_VM" || true
@@ -674,7 +720,7 @@ bootstrap() {
     kv "Claude" "$(tart exec "$GOLD_VM" claude --version 2>/dev/null | head -1)"
   fi
 
-  stop_vm "$GOLD_VM" || warn "Unable to stop gold VM."
+  cleanup_owned_gold_vm || die "Gold VM maintenance completed, but the VM could not be stopped."
 
   printf "\n"
   ok "Gold image ready: $GOLD_VM"
@@ -707,6 +753,7 @@ update_gold() {
 
   start_vm "$GOLD_VM" "" "true" ||
     die "Unable to start gold VM."
+  own_gold_vm_lifecycle "$GOLD_VM"
 
   fix_dns "$GOLD_VM"
   update_brew "$GOLD_VM" || true
@@ -714,7 +761,8 @@ update_gold() {
   show_auth_status "$GOLD_VM"
   configure_codex "$GOLD_VM"
 
-  stop_vm "$GOLD_VM" || warn "Unable to stop gold VM."
+  cleanup_owned_gold_vm ||
+    die "Gold VM maintenance completed, but the VM could not be stopped."
 
   printf "\n"
   ok "Gold image refreshed"
@@ -734,18 +782,17 @@ xml_escape() {
 }
 
 resolve_script_path() {
-  local candidate="$0" directory
+  local candidate="$0"
 
   if [[ "$candidate" != */* ]]; then
     candidate="$(command -v -- "$candidate" 2>/dev/null)" || return 1
   fi
 
-  directory="$(cd "$(dirname "$candidate")" && pwd -P)" || return 1
-  printf '%s/%s' "$directory" "$(basename "$candidate")"
+  /usr/bin/realpath "$candidate"
 }
 
 schedule_update() {
-  local frequency="$1" script_path script_xml log_xml error_log_xml
+  local frequency="$1" script_path script_xml log_xml error_log_xml devroot
 
   [[ "$frequency" == "weekly" ]] ||
     die "Unsupported schedule '$frequency'. Tartbox currently supports: weekly"
@@ -754,6 +801,17 @@ schedule_update() {
   script_path="$(resolve_script_path)" ||
     die "Unable to resolve the Tartbox executable for scheduled maintenance."
   [[ -x "$script_path" ]] || die "Unable to resolve an executable Tartbox script."
+
+  [[ -d "$DEV_ROOT" ]] ||
+    die "Development root does not exist: $DEV_ROOT"
+  devroot="$(cd "$DEV_ROOT" && pwd -P)" ||
+    die "Unable to resolve development root."
+
+  case "$script_path" in
+    "$devroot"|"$devroot"/*)
+      die "Refusing to schedule a Tartbox executable inside TARTBOX_DEV_ROOT. Install Tartbox in a host-only location such as /usr/local/bin or /opt/homebrew/bin, then schedule it again."
+      ;;
+  esac
 
   script_xml="$(xml_escape "$script_path")"
   log_xml="$(xml_escape "$SCHEDULE_LOG_DIR/update-gold.log")"
@@ -773,7 +831,7 @@ schedule_update() {
     printf '%s\n' '<plist version="1.0"><dict>'
     printf '  <key>Label</key><string>%s</string>\n' "$LAUNCH_AGENT_LABEL"
     printf '  <key>ProgramArguments</key><array><string>%s</string><string>--update-gold</string></array>\n' "$script_xml"
-    printf '%s\n' '  <key>StartCalendarInterval</key><dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>'
+    printf '%s\n' '  <key>StartCalendarInterval</key><dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>'
     printf '  <key>StandardOutPath</key><string>%s</string>\n' "$log_xml"
     printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$error_log_xml"
     printf '%s\n' '  <key>ProcessType</key><string>Background</string>'
@@ -878,6 +936,10 @@ run_project() {
     vm="$custom_name"
   else
     vm="$(project_vm_name "$project")"
+  fi
+
+  if [[ "$vm" == "$GOLD_VM" ]]; then
+    die "Gold VM '$GOLD_VM' cannot be used as a project VM. Choose a different --name or omit it."
   fi
 
   vm_exists "$GOLD_VM" ||
