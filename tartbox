@@ -85,7 +85,7 @@ die() {
 header() {
   printf "\n"
   printf "%s╭──────────────────────────────────────────────╮%s\n" "$BOLD" "$RESET"
-  printf "%s│   Tartbox                                  │%s\n" "$BOLD" "$RESET"
+  printf "%s│  >_ Tartbox                                 │%s\n" "$BOLD" "$RESET"
   printf "%s╰──────────────────────────────────────────────╯%s\n" "$BOLD" "$RESET"
   printf "\n"
 }
