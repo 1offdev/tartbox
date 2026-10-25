@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Tartbox v0.2.0
+# Tartbox v0.2.1
 #
 # Small, auditable wrapper around Tart for isolated macOS/Xcode development.
 #
@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 GOLD_VM="${TARTBOX_GOLD_VM:-goldcopy}"
 BASE_IMAGE="${TARTBOX_BASE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:latest}"
@@ -29,6 +29,7 @@ GUEST_WORKSPACE="/Volumes/My Shared Files/workspace"
 LAUNCH_AGENT_LABEL="dev.tartbox.update-gold"
 LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
 SCHEDULE_LOG_DIR="$HOME/Library/Logs/Tartbox"
+SCHEDULE_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 KNOWN_AGENTS=(
   codex
@@ -43,6 +44,9 @@ KNOWN_AGENTS=(
 )
 
 PROJECT=""
+STARTUP_LOG=""
+STARTING_VM=""
+STARTING_PID=""
 
 # ─────────────────────────────────────────────────────────────
 # Terminal UI
@@ -139,6 +143,17 @@ validate_vm_name() {
     die "Invalid VM name '$name'. Use letters, numbers, '.', '_' or '-', starting with a letter or number."
 }
 
+refuse_running_project_vm() {
+  local vm="$1"
+
+  fail "Tartbox will not attach an unrestricted agent to an already-running project VM."
+  printf "It cannot verify how that VM was started or which host directories are currently shared.\n\n" >&2
+  printf "Stop the VM first:\n" >&2
+  printf "  tart stop %s\n\n" "$vm" >&2
+  printf "Then run Tartbox again.\n" >&2
+  exit 1
+}
+
 validate_workspace() {
   local devroot project parent
 
@@ -228,7 +243,7 @@ wait_for_guest() {
   local log="$3"
   local attempts=0 elapsed=0
 
-  while ! tart exec "$vm" true >/dev/null 2>&1; do
+  while true; do
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid" 2>/dev/null || true
       [[ -t 1 ]] && printf "\r\033[K"
@@ -239,6 +254,10 @@ wait_for_guest() {
         cat "$log"
       fi
       return 1
+    fi
+
+    if tart exec "$vm" true >/dev/null 2>&1; then
+      break
     fi
 
     attempts=$((attempts + 1))
@@ -268,15 +287,70 @@ wait_for_guest() {
   return 0
 }
 
+create_startup_log() {
+  local temp_root temp_dir
+
+  temp_root="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+  if [[ -z "$temp_root" || ! -d "$temp_root" || ! -w "$temp_root" ]]; then
+    temp_root="/tmp"
+  fi
+
+  temp_dir="$(/usr/bin/mktemp -d "${temp_root%/}/tartbox.XXXXXXXX")" ||
+    die "Unable to create a secure temporary directory for Tart output."
+  STARTUP_LOG="$temp_dir/tart-run.log"
+}
+
+remove_startup_log() {
+  local log="$1" temp_dir
+  temp_dir="$(dirname "$log")"
+
+  rm -f -- "$log" 2>/dev/null || true
+  rmdir -- "$temp_dir" 2>/dev/null || true
+}
+
+cleanup_failed_start() {
+  local vm="$1" pid="$2" attempts=0
+
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "Terminating Tart process from the failed startup attempt."
+    kill "$pid" 2>/dev/null || true
+
+    while kill -0 "$pid" 2>/dev/null && (( attempts < 10 )); do
+      attempts=$((attempts + 1))
+      sleep 1
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "Tart did not exit after SIGTERM; sending SIGKILL."
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+
+  if vm_running "$vm"; then
+    warn "Stopping VM from the failed Tartbox startup attempt: $vm"
+    tart stop "$vm" >/dev/null 2>&1 ||
+      warn "Unable to stop '$vm'; inspect it with: tart list"
+  fi
+}
+
+abort_startup() {
+  trap - INT TERM HUP
+  warn "Startup interrupted; cleaning up Tartbox's VM start attempt."
+  cleanup_failed_start "$STARTING_VM" "$STARTING_PID"
+  remove_startup_log "$STARTUP_LOG"
+  exit 130
+}
+
 start_vm() {
   local vm="$1"
   local workspace="${2:-}"
   local headless="${3:-false}"
-  local log="${TMPDIR:-/tmp}/tartbox-${vm}.log"
+  local log temp_dir
 
   if vm_running "$vm"; then
-    ok "VM already running: $vm"
-    return 0
+    fail "VM is already running: $vm"
+    return 1
   fi
 
   local args=(run --net-softnet)
@@ -292,15 +366,37 @@ start_vm() {
   args+=("$vm")
 
   info "Starting VM: $vm"
-  : > "$log"
+  create_startup_log
+  log="$STARTUP_LOG"
+  temp_dir="$(dirname "$log")"
+  : > "$log" || {
+    rmdir -- "$temp_dir" 2>/dev/null || true
+    die "Unable to create secure Tart startup log."
+  }
 
   nohup tart "${args[@]}" >"$log" 2>&1 &
   local pid=$!
+  STARTING_VM="$vm"
+  STARTING_PID="$pid"
+  trap abort_startup INT TERM HUP
 
   if ! wait_for_guest "$vm" "$pid" "$log"; then
+    trap - INT TERM HUP
+    cleanup_failed_start "$vm" "$pid"
+    remove_startup_log "$log"
+    STARTING_VM=""
+    STARTING_PID=""
+    STARTUP_LOG=""
     return 1
   fi
 
+  trap - INT TERM HUP
+  # Tart retains the open descriptor while the VM runs. Unlinking the secure
+  # startup log prevents stale files without disrupting the background process.
+  remove_startup_log "$log"
+  STARTING_VM=""
+  STARTING_PID=""
+  STARTUP_LOG=""
   return 0
 }
 
@@ -474,6 +570,14 @@ configure_codex() {
 
   info "Configuring Codex Full Access"
 
+  if tart exec "$vm" zsh -lc 'test -f ~/.codex/config.toml' >/dev/null 2>&1; then
+    warn "Replacing ~/.codex/config.toml to guarantee top-level Full Access settings."
+    info "Backing up existing config to ~/.codex/config.toml.tartbox-backup"
+    tart exec "$vm" zsh -lc \
+      'cp -p ~/.codex/config.toml ~/.codex/config.toml.tartbox-backup' ||
+      die "Unable to back up the existing Codex configuration."
+  fi
+
   tart exec "$vm" zsh -lc \
     'mkdir -p ~/.codex &&
      cat > ~/.codex/config.toml <<'"'"'EOF'"'"'
@@ -594,6 +698,10 @@ update_gold() {
   vm_exists "$GOLD_VM" ||
     die "Gold VM '$GOLD_VM' does not exist. Run: tartbox --bootstrap"
 
+  if vm_running "$GOLD_VM"; then
+    die "Gold VM '$GOLD_VM' is already running. Stop it before maintenance so Tartbox owns the complete maintenance lifecycle."
+  fi
+
   kv "Gold VM" "$GOLD_VM"
   kv "Tart home" "${TART_HOME:-$HOME/.tart}"
 
@@ -625,6 +733,17 @@ xml_escape() {
     -e "s/'/\&apos;/g"
 }
 
+resolve_script_path() {
+  local candidate="$0" directory
+
+  if [[ "$candidate" != */* ]]; then
+    candidate="$(command -v -- "$candidate" 2>/dev/null)" || return 1
+  fi
+
+  directory="$(cd "$(dirname "$candidate")" && pwd -P)" || return 1
+  printf '%s/%s' "$directory" "$(basename "$candidate")"
+}
+
 schedule_update() {
   local frequency="$1" script_path script_xml log_xml error_log_xml
 
@@ -632,7 +751,8 @@ schedule_update() {
     die "Unsupported schedule '$frequency'. Tartbox currently supports: weekly"
   require_tart
 
-  script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+  script_path="$(resolve_script_path)" ||
+    die "Unable to resolve the Tartbox executable for scheduled maintenance."
   [[ -x "$script_path" ]] || die "Unable to resolve an executable Tartbox script."
 
   script_xml="$(xml_escape "$script_path")"
@@ -658,7 +778,7 @@ schedule_update() {
     printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$error_log_xml"
     printf '%s\n' '  <key>ProcessType</key><string>Background</string>'
     printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
-    printf '    <key>PATH</key><string>%s</string>\n' "$(xml_escape "${PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}")"
+    printf '    <key>PATH</key><string>%s</string>\n' "$(xml_escape "$SCHEDULE_PATH")"
     [[ -n "${TART_HOME:-}" ]] && printf '    <key>TART_HOME</key><string>%s</string>\n' "$(xml_escape "$TART_HOME")"
     printf '    <key>TARTBOX_DEV_ROOT</key><string>%s</string>\n' "$(xml_escape "$DEV_ROOT")"
     printf '    <key>TARTBOX_GOLD_VM</key><string>%s</string>\n' "$(xml_escape "$GOLD_VM")"
@@ -775,9 +895,7 @@ run_project() {
 
   if vm_exists "$vm"; then
     ok "Project VM exists"
-    if [[ -n "$custom_name" ]] && vm_running "$vm"; then
-      die "Custom-named VM '$vm' is already running. Stop it before reuse so Tartbox can mount the selected workspace explicitly."
-    fi
+    vm_running "$vm" && refuse_running_project_vm "$vm"
   else
     info "Creating project VM from $GOLD_VM"
     tart clone "$GOLD_VM" "$vm" ||
@@ -886,6 +1004,7 @@ EXAMPLES
 
 VM LIFECYCLE
   Exiting an agent does NOT stop or delete the project VM.
+  Tartbox refuses to attach to an already-running project VM.
 
   Stop:
     tart stop <vm>
@@ -917,6 +1036,8 @@ AGENT="codex"
 HEADLESS="false"
 DO_UPDATE="true"
 CUSTOM_VM_NAME=""
+
+validate_vm_name "$GOLD_VM"
 
 if (( $# == 0 )); then
   run_project "$AGENT" "$HEADLESS" "$DO_UPDATE" "$CUSTOM_VM_NAME"
