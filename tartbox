@@ -159,8 +159,19 @@ refuse_running_project_vm() {
 validate_workspace() {
   local devroot project parent
 
+  [[ "$DEV_ROOT" != *$'\n'* ]] ||
+    die "Tartbox does not support newline-bearing workspace or development-root paths."
+
   [[ -d "$DEV_ROOT" ]] ||
     die "Development root does not exist: $DEV_ROOT"
+
+  if (cd "$DEV_ROOT" && pwd -P) | awk 'NR > 1 { found=1 } END { exit !found }'; then
+    die "Tartbox does not support newline-bearing workspace or development-root paths."
+  fi
+
+  if pwd -P | awk 'NR > 1 { found=1 } END { exit !found }'; then
+    die "Tartbox does not support newline-bearing workspace or development-root paths."
+  fi
 
   devroot="$(cd "$DEV_ROOT" && pwd -P)" ||
     die "Unable to resolve development root."

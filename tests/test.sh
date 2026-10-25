@@ -62,6 +62,13 @@ count_matches() {
 
 mkdir -p "$MOCK_BIN" "$MOCK_STATE" "$TEST_ROOT/home" \
   "$TEST_ROOT/dev/project space" "$TEST_ROOT/dev/nested/child"
+
+TRAILING_NEWLINE_PROJECT="$TEST_ROOT/dev/trailing-newline"$'\n'
+EMBEDDED_NEWLINE_PROJECT="$TEST_ROOT/dev/embedded"$'\n'"newline"
+NEWLINE_DEV_ROOT="$TEST_ROOT/dev-root"$'\n'"newline"
+mkdir -p "$TRAILING_NEWLINE_PROJECT" "$EMBEDDED_NEWLINE_PROJECT" \
+  "$NEWLINE_DEV_ROOT/project"
+
 : > "$MOCK_LOG"
 : > "$MOCK_STATE/running"
 
@@ -176,6 +183,32 @@ export MOCK_LOG MOCK_STATE
 PROJECT="$TEST_ROOT/dev/project space"
 PROJECT_HASH="$(printf '%s' "$PROJECT" | shasum -a 256 | awk '{print substr($1,1,8)}')"
 AUTO_VM="tartbox-project-space-$PROJECT_HASH"
+
+# Newline-bearing physical paths are unsupported and fail before Tart access.
+: > "$MOCK_LOG"
+if (cd "$TRAILING_NEWLINE_PROJECT" && "$TARTBOX" --no-update >"$TEST_ROOT/trailing-newline.out" 2>&1); then
+  fail "trailing-newline workspace is refused"
+else
+  pass "trailing-newline workspace is refused"
+fi
+assert "trailing-newline refusal explains unsupported path" contains "$TEST_ROOT/trailing-newline.out" "does not support newline-bearing"
+assert "trailing-newline workspace makes no Tart calls" test ! -s "$MOCK_LOG"
+
+: > "$MOCK_LOG"
+if (cd "$EMBEDDED_NEWLINE_PROJECT" && "$TARTBOX" --no-update >"$TEST_ROOT/embedded-newline.out" 2>&1); then
+  fail "embedded-newline workspace is refused"
+else
+  pass "embedded-newline workspace is refused"
+fi
+assert "embedded-newline workspace makes no Tart calls" test ! -s "$MOCK_LOG"
+
+: > "$MOCK_LOG"
+if (cd "$NEWLINE_DEV_ROOT/project" && TARTBOX_DEV_ROOT="$NEWLINE_DEV_ROOT" "$TARTBOX" --no-update >"$TEST_ROOT/newline-root.out" 2>&1); then
+  fail "newline-bearing development root is refused"
+else
+  pass "newline-bearing development root is refused"
+fi
+assert "newline-bearing development root makes no Tart calls" test ! -s "$MOCK_LOG"
 
 # Invalid workspaces must fail before even read-only Tart inspection.
 : > "$MOCK_LOG"
