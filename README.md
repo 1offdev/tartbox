@@ -200,6 +200,33 @@ Before running the project, give another model the repository and this prompt:
 ```text
 Audit this Tartbox repository before I run it. Treat the source code as authoritative. Do not trust claims in the README unless they match the implementation.
 
+SOURCE VERIFICATION IS A MANDATORY PRECONDITION. Establish the exact revision of the complete `tartbox` script and `README.md` before doing any security analysis. Prefer a verified Git checkout over GitHub pages, web retrieval, search results, cached context, or previously retrieved files.
+
+When Git access is available, run and report at minimum:
+
+git remote get-url origin
+git rev-parse --abbrev-ref HEAD
+git rev-parse HEAD
+git log -1 --oneline
+git status --short
+
+Your report must begin with this source identity:
+
+Repository:
+Branch:
+Commit: <full SHA>
+Latest commit:
+Working tree:
+Source acquisition method:
+
+The full commit SHA is the primary source identity. If I supplied a specific SHA, obtain that exact revision—using a temporary clone or worktree if appropriate—and verify that the complete source being examined corresponds to it. Do not modify my normal working tree merely to perform the audit.
+
+FAIL CLOSED: if you cannot establish an exact commit SHA for the complete source you are examining, STOP. Do not perform a security audit while assuming that web retrieval, cached context, search results, a branch name, or previously retrieved files represent current HEAD. Tell me that you cannot produce a commit-pinned, reproducible audit from the available source. If I requested a specific SHA and you cannot obtain and verify that exact revision, STOP rather than auditing another revision.
+
+If the audit intentionally includes local uncommitted changes, state this prominently. Report the HEAD SHA and complete `git status --short` output, say that uncommitted changes are included, and explain that the result is not reproducible solely from the reported commit. Do not describe a dirty-tree audit as an audit of the commit itself.
+
+Only after source verification succeeds, perform the following audit:
+
 1. Read the complete `tartbox` shell script and `README.md`.
 2. Explain in plain language every persistent change Tartbox can make to the host.
 3. Identify every host path shared with a VM, including whether each share is writable.
@@ -220,6 +247,10 @@ Audit this Tartbox repository before I run it. Treat the source code as authorit
 18. Identify complete-overwrite configuration operations, what they replace, and whether backups are reliable.
 
 Pay particular attention to whether workspace refusal occurs before any VM clone, start, modification, or update; whether a custom VM name can alter the mounted host path; and whether any host directories other than the selected project are exposed to a VM.
+
+For a clean checkout, end the report with: "I verified that the complete Tartbox source examined by this audit corresponds to commit <full SHA>." If you cannot truthfully make that statement, label the result UNVERIFIED and do not present security conclusions as applying to current Tartbox HEAD. For a requested commit-pinned audit, inability to make that statement means STOP without auditing.
+
+For an intentional dirty-tree audit, do not make the clean-checkout statement. Instead end with: "DIRTY WORKTREE AUDIT — the committed baseline is <full HEAD SHA>, and this audit also includes the uncommitted changes listed above. It is not reproducible from that commit alone and is not an audit of the commit itself." Apply conclusions only to those exact local files, not to current remote HEAD.
 ```
 
 ## License and upstream references
