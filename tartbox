@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Tartbox v0.2.1
+# Tartbox v0.2.2
 #
 # Small, auditable wrapper around Tart for isolated macOS/Xcode development.
 #
@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 
 GOLD_VM="${TARTBOX_GOLD_VM:-goldcopy}"
 BASE_IMAGE="${TARTBOX_BASE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:latest}"
