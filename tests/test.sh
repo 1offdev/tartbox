@@ -406,7 +406,8 @@ else
 fi
 assert "unsafe scheduling explains host-only install" contains "$TEST_ROOT/schedule-unsafe.out" "host-only location"
 
-mkdir -p "$TEST_ROOT/dev/tool" "$TEST_ROOT/host-bin"
+mkdir -p "$TEST_ROOT/dev/tool" "$TEST_ROOT/host-bin" \
+  "$TEST_ROOT/host-bin-chain" "$TEST_ROOT/host-only-bin"
 cp "$TARTBOX" "$TEST_ROOT/dev/tool/tartbox"
 chmod +x "$TEST_ROOT/dev/tool/tartbox"
 ln -s "$TEST_ROOT/dev/tool/tartbox" "$TEST_ROOT/host-bin/tartbox"
@@ -415,6 +416,26 @@ if "$TEST_ROOT/host-bin/tartbox" --schedule-update >"$TEST_ROOT/schedule-symlink
 else
   pass "scheduling resolves symlink into development root"
 fi
+
+ln -s "$TEST_ROOT/host-bin/tartbox" "$TEST_ROOT/host-bin-chain/tartbox"
+if "$TEST_ROOT/host-bin-chain/tartbox" --schedule-update >"$TEST_ROOT/schedule-symlink-chain.out" 2>&1; then
+  fail "scheduling resolves a symlink chain into development root"
+else
+  pass "scheduling resolves a symlink chain into development root"
+fi
+
+cp "$TARTBOX" "$TEST_ROOT/host-only-bin/tartbox"
+chmod +x "$TEST_ROOT/host-only-bin/tartbox"
+PATH="$TEST_ROOT/host-only-bin:$PATH" tartbox --schedule-update >"$TEST_ROOT/schedule-path.out" 2>&1
+PLIST="$HOME/Library/LaunchAgents/dev.tartbox.update-gold.plist"
+assert "PATH invocation records its physical host-only executable" contains "$PLIST" "$TEST_ROOT/host-only-bin/tartbox"
+
+if bash -c 'source "$1" --schedule-update' missing-tartbox "$TARTBOX" >"$TEST_ROOT/schedule-resolution-failure.out" 2>&1; then
+  fail "unresolvable executable path is refused"
+else
+  pass "unresolvable executable path is refused"
+fi
+assert "resolution failure is reported clearly" contains "$TEST_ROOT/schedule-resolution-failure.out" "Unable to resolve the Tartbox executable"
 
 # Scheduled jobs use Sunday and a fixed PATH, not the invoking value.
 : > "$MOCK_LOG"

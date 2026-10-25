@@ -793,13 +793,44 @@ xml_escape() {
 }
 
 resolve_script_path() {
-  local candidate="$0"
+  local candidate="$0" target directory
+  local symlink_count=0
 
   if [[ "$candidate" != */* ]]; then
     candidate="$(command -v -- "$candidate" 2>/dev/null)" || return 1
   fi
 
-  /usr/bin/realpath "$candidate"
+  [[ "$candidate" == /* ]] || candidate="$PWD/$candidate"
+  [[ "$candidate" != *$'\n'* ]] || return 1
+
+  while [[ -L "$candidate" ]]; do
+    ((symlink_count += 1))
+    ((symlink_count <= 40)) || return 1
+
+    if /usr/bin/readlink "$candidate" |
+      /usr/bin/awk 'NR > 1 { found=1 } END { exit !found }'
+    then
+      return 1
+    fi
+
+    target="$(/usr/bin/readlink "$candidate")" || return 1
+    [[ -n "$target" && "$target" != *$'\n'* ]] || return 1
+
+    if [[ "$target" == /* ]]; then
+      candidate="$target"
+    else
+      candidate="$(/usr/bin/dirname "$candidate")/$target"
+    fi
+  done
+
+  [[ -e "$candidate" ]] || return 1
+  if (cd "$(/usr/bin/dirname "$candidate")" && pwd -P) |
+    /usr/bin/awk 'NR > 1 { found=1 } END { exit !found }'
+  then
+    return 1
+  fi
+  directory="$(cd "$(/usr/bin/dirname "$candidate")" && pwd -P)" || return 1
+  printf '%s/%s\n' "$directory" "$(/usr/bin/basename "$candidate")"
 }
 
 schedule_update() {
